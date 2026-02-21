@@ -4,7 +4,7 @@ const busboy = require("busboy");
 const ignoreStream = require("./ignore-stream");
 const Upload = require("./Upload");
 const HttpError = require("./HttpError");
-const { isObject, deepSet } = require("./object-utils");
+const { unlink } = require("fs");
 
 /**
  * Official [GraphQL multipart request spec](https://github.com/jaydenseric/graphql-multipart-request-spec)
@@ -15,6 +15,25 @@ const { isObject, deepSet } = require("./object-utils");
  * @ignore
  */
 const SPEC_URL = "https://github.com/jaydenseric/graphql-multipart-request-spec";
+
+function isObject(val) {
+    return val != null && typeof val === "object" && Array.isArray(val) === false;
+}
+
+/**
+ * Deep set value using dot separated `path` of the object.
+ * @param object {Object} Any JS object.
+ * @param path {String} String like "input.docs.0.file"
+ * @param value {*} The value we set.
+ * @ignore
+ * @private
+ */
+function deepSet(object, path, value) {
+    const props = path.split("."); // E.g. "input.docs.0.file" -> ["input", "docs", "0", "file"]
+    while (props.length !== 1) object = object[props.shift()];
+    if (!object) throw new Error(`The path ${path} was not found in the GraphQL query.`);
+    object[props[0]] = value;
+}
 
 const noop = () => {};
 
@@ -88,7 +107,7 @@ module.exports = async function processRequest(
     }
 
     const contentType = req && req.headers && req.headers["content-type"];
-    if (typeof contentType !== "string" || !contentType.includes("multipart/form-data;")) {
+    if (typeof contentType !== "string" || !contentType.includes("multipart/form-data")) {
         throw new HttpError(400, `Invalid content-type ${contentType}, should be multipart/form-data;`);
     }
 
@@ -126,7 +145,9 @@ module.exports = async function processRequest(
             // it’s still good to guard against it happening in case it’s possible now
             // or in the future.
             // coverage ignore next line
-            if (exitError) return;
+            if (exitError) {
+                return;
+            }
 
             let isParserError = false;
             if (message instanceof Error) {
@@ -231,7 +252,6 @@ module.exports = async function processRequest(
         let returnedStreams = new Set();
         parser.on("file", (fieldName, stream, { filename, encoding, mimeType: mimetype }) => {
             lastFileStream = stream;
-
             if (!map) {
                 ignoreStream(stream);
                 return exit(`Misordered multipart fields; files should follow 'map' (${SPEC_URL}).`);
@@ -263,14 +283,12 @@ module.exports = async function processRequest(
                 filename,
                 mimetype,
                 encoding,
-                createReadStream(...args) {
-                    if (args && args.some(Boolean)) {
-                        throw new Error(
-                            "graphql-upload-minimal does not support createReadStream() arguments. Use graphql-upload NPM module if you need this feature."
-                        );
-                    }
-
+                createReadStream(endPath) {
                     const error = fileError || (released ? exitError : null);
+                    if (endPath && error) {
+                        unlink(endPath, () => {});
+                        throw error;
+                    }
                     if (error) throw error;
 
                     if (returnedStreams.has(stream)) {
@@ -282,12 +300,15 @@ module.exports = async function processRequest(
                         return stream;
                     }
                 },
+                ignoreStream: () => ignoreStream(stream)
             };
 
             upload.resolve(file);
         });
 
-        parser.once("filesLimit", () => exit(`${maxFiles} max file uploads exceeded.`, 413));
+        parser.once("filesLimit", () => {
+            return exit(`${maxFiles} max file uploads exceeded.`, 413)
+        });
 
         parser.once("close", () => {
             req.unpipe(parser);
